@@ -8,7 +8,7 @@ import asyncio
 from pathlib import Path
 
 app = FastAPI()
-semaphore = Semaphore(5)
+semaphore = Semaphore(10)
 
 # مجلد النتائج
 RESULTS_DIR = Path("results")
