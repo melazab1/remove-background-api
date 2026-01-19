@@ -1,25 +1,23 @@
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse
 import subprocess
 import os
 import uuid
 from asyncio import Semaphore
+import httpx
+from typing import Optional
 
 app = FastAPI()
-
-# تحديد عدد المعالجات المتزامنة (5 في نفس الوقت)
 semaphore = Semaphore(5)
 
 @app.get("/")
 def read_root():
     return {"status": "API is running"}
 
-async def process_image(file_content: bytes) -> bytes:
+async def process_and_callback(file_content: bytes, job_id: str, webhook_url: str):
     async with semaphore:
-        # إنشاء اسم فريد لكل ملف
-        unique_id = str(uuid.uuid4())
-        input_path = f"temp_input_{unique_id}.png"
-        output_path = f"temp_output_{unique_id}.png"
+        input_path = f"temp_input_{job_id}.png"
+        output_path = f"temp_output_{job_id}.png"
         
         try:
             with open(input_path, "wb") as f:
@@ -28,18 +26,36 @@ async def process_image(file_content: bytes) -> bytes:
             subprocess.run(["convert", input_path, "-fuzz", "10%", "-transparent", "white", output_path])
             
             with open(output_path, "rb") as f:
-                result = f.read()
+                result_bytes = f.read()
             
-            return result
+            # إرسال النتيجة للـ webhook
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                files = {"file": (f"{job_id}.png", result_bytes, "image/png")}
+                await client.post(webhook_url, files=files, data={"job_id": job_id, "status": "completed"})
+        
+        except Exception as e:
+            # إرسال خطأ للـ webhook
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.post(webhook_url, json={"job_id": job_id, "status": "failed", "error": str(e)})
+        
         finally:
-            # تنظيف الملفات
             if os.path.exists(input_path):
                 os.remove(input_path)
             if os.path.exists(output_path):
                 os.remove(output_path)
 
 @app.post("/remove-background")
-async def remove_background(file: UploadFile = File(...)):
+async def remove_background(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    webhook_url: Optional[str] = None
+):
+    job_id = str(uuid.uuid4())
     file_content = await file.read()
-    result = await process_image(file_content)
-    return Response(content=result, media_type="image/png")
+    
+    if webhook_url:
+        # معالجة async مع webhook
+        background_tasks.add_task(process_and_callback, file_content, job_id, webhook_url)
+        return JSONResponse({"job_id": job_id, "status": "processing", "message": "Will send result to webhook"})
+    else:
+        return JSONResponse({"error": "webhook_url is required"}, status_code=400)
